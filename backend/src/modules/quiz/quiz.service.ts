@@ -1,64 +1,26 @@
-import crypto from "crypto";
-import { pgPool } from "../../db/pool";
-import { redis } from "../../redis/client";
-import { getEnv } from "../../config/env";
-import { normalizeAnswer, sha256Hex } from "../../utils/hash";
-import { applyAdaptiveStep } from "./adaptive";
-import { computeScoreDelta } from "./scoring";
+"use strict";
 
-type QuestionRow = {
-  id: string;
-  difficulty: number;
-  prompt: string;
-  choices: unknown; // jsonb
-  correct_answer_hash: string;
-};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ensureUserExists = ensureUserExists;
+exports.createFreshSession = createFreshSession;
+exports.getNextQuestion = getNextQuestion;
+exports.submitAnswer = submitAnswer;
 
-export type QuizQuestion = {
-  questionId: string;
-  difficulty: number;
-  prompt: string;
-  choices: string[];
-};
-
-export type UserState = {
-  userId: string;
-  sessionId: string;
-  currentDifficulty: number;
-  currentScore: number;
-  currentStreak: number;
-  highestStreak: number;
-  totalAnswered: number;
-  totalCorrect: number;
-  wrongStreak: number;
-  emaPerformance: number;
-  cooldown: number;
-  currentQuestionId: string | null;
-  questionIssuedAt: string | null; // ISO
-  expiresAt: string; // ISO
-};
-
-export type NextResponse = QuizQuestion & {
-  sessionId: string;
-  currentScore: number;
-  currentStreak: number;
-};
-
-export type AnswerResponse = {
-  correct: boolean;
-  newDifficulty: number;
-  newStreak: number;
-  scoreDelta: number;
-  totalScore: number;
-};
+const { randomUUID } = require("crypto");
+const { pgPool } = require("../../db/pool");
+const { getEnv } = require("../../config/env");
+const { sha256Hex, normalizeAnswer } = require("../../utils/hash");
 
 const env = getEnv();
 
-function stateKey(userId: string, sessionId: string) {
+// In-memory store (temporary Redis replacement)
+const memoryStore = new Map();
+
+function stateKey(userId, sessionId) {
   return `bb:state:${userId}:${sessionId}`;
 }
 
-export async function ensureUserExists(userId: string): Promise<void> {
+async function ensureUserExists(userId) {
   await pgPool.query(
     `INSERT INTO users (id)
      VALUES ($1)
@@ -67,33 +29,17 @@ export async function ensureUserExists(userId: string): Promise<void> {
   );
 }
 
-async function loadStateFromPostgres(userId: string, sessionId: string): Promise<UserState | null> {
+async function loadStateFromPostgres(userId, sessionId) {
   const { rows } = await pgPool.query(
-    `SELECT
-       user_id,
-       session_id,
-       current_difficulty,
-       current_score,
-       current_streak,
-       highest_streak,
-       total_answered,
-       total_correct,
-       wrong_streak,
-       ema_performance,
-       cooldown,
-       current_question_id,
-       question_issued_at,
-       expires_at
-     FROM user_state
+    `SELECT * FROM user_state
      WHERE user_id = $1 AND session_id = $2
      LIMIT 1`,
     [userId, sessionId]
   );
 
-  if (rows.length === 0) return null;
+  if (!rows.length) return null;
 
-  const r = rows[0] as any;
-  // Treat expired sessions as missing.
+  const r = rows[0];
   if (new Date(r.expires_at).getTime() <= Date.now()) return null;
 
   return {
@@ -108,66 +54,53 @@ async function loadStateFromPostgres(userId: string, sessionId: string): Promise
     wrongStreak: Number(r.wrong_streak),
     emaPerformance: Number(r.ema_performance),
     cooldown: Number(r.cooldown),
-    currentQuestionId: r.current_question_id ?? null,
-    questionIssuedAt: r.question_issued_at ? new Date(r.question_issued_at).toISOString() : null,
-    expiresAt: new Date(r.expires_at).toISOString()
+    currentQuestionId: r.current_question_id,
+    questionIssuedAt: r.question_issued_at,
   };
 }
 
-async function loadState(userId: string, sessionId: string): Promise<UserState | null> {
+async function loadState(userId, sessionId) {
   const key = stateKey(userId, sessionId);
-  const cached = await redis.get(key);
-  if (cached) {
-    try {
-      return JSON.parse(cached) as UserState;
-    } catch {
-      // fall through to DB
-    }
-  }
+  const cached = memoryStore.get(key);
 
-  const fromDb = await loadStateFromPostgres(userId, sessionId);
-  if (!fromDb) return null;
+  if (cached) return JSON.parse(cached);
 
-  await redis.set(key, JSON.stringify(fromDb), "EX", env.SESSION_TTL_SECONDS);
-  return fromDb;
+  const db = await loadStateFromPostgres(userId, sessionId);
+  if (!db) return null;
+
+  memoryStore.set(key, JSON.stringify(db));
+  return db;
 }
 
-async function persistState(state: UserState): Promise<void> {
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + env.SESSION_TTL_SECONDS * 1000);
-
-  state.expiresAt = expiresAt.toISOString();
+async function persistState(state) {
+  const expiresAt = new Date(Date.now() + env.SESSION_TTL_SECONDS * 1000);
 
   await pgPool.query(
     `INSERT INTO user_state (
-        user_id, session_id,
-        current_difficulty, current_score, current_streak, highest_streak,
-        total_answered, total_correct,
-        wrong_streak, ema_performance, cooldown,
-        current_question_id, question_issued_at,
-        last_seen_at, expires_at
-     ) VALUES (
-        $1, $2,
-        $3, $4, $5, $6,
-        $7, $8,
-        $9, $10, $11,
-        $12, $13,
-        now(), $14
-     )
-     ON CONFLICT (user_id, session_id) DO UPDATE SET
-       current_difficulty = EXCLUDED.current_difficulty,
-       current_score = EXCLUDED.current_score,
-       current_streak = EXCLUDED.current_streak,
-       highest_streak = EXCLUDED.highest_streak,
-       total_answered = EXCLUDED.total_answered,
-       total_correct = EXCLUDED.total_correct,
-       wrong_streak = EXCLUDED.wrong_streak,
-       ema_performance = EXCLUDED.ema_performance,
-       cooldown = EXCLUDED.cooldown,
-       current_question_id = EXCLUDED.current_question_id,
-       question_issued_at = EXCLUDED.question_issued_at,
-       last_seen_at = now(),
-       expires_at = EXCLUDED.expires_at`,
+      user_id, session_id,
+      current_difficulty, current_score, current_streak, highest_streak,
+      total_answered, total_correct,
+      wrong_streak, ema_performance, cooldown,
+      current_question_id, question_issued_at,
+      last_seen_at, expires_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),$14
+    )
+    ON CONFLICT (user_id, session_id) DO UPDATE SET
+      current_difficulty = EXCLUDED.current_difficulty,
+      current_score = EXCLUDED.current_score,
+      current_streak = EXCLUDED.current_streak,
+      highest_streak = EXCLUDED.highest_streak,
+      total_answered = EXCLUDED.total_answered,
+      total_correct = EXCLUDED.total_correct,
+      wrong_streak = EXCLUDED.wrong_streak,
+      ema_performance = EXCLUDED.ema_performance,
+      cooldown = EXCLUDED.cooldown,
+      current_question_id = EXCLUDED.current_question_id,
+      question_issued_at = EXCLUDED.question_issued_at,
+      last_seen_at = now(),
+      expires_at = EXCLUDED.expires_at`,
     [
       state.userId,
       state.sessionId,
@@ -181,76 +114,22 @@ async function persistState(state: UserState): Promise<void> {
       state.emaPerformance,
       state.cooldown,
       state.currentQuestionId,
-      state.questionIssuedAt ? new Date(state.questionIssuedAt) : null,
-      expiresAt
+      state.questionIssuedAt,
+      expiresAt,
     ]
   );
 
-  await redis.set(stateKey(state.userId, state.sessionId), JSON.stringify(state), "EX", env.SESSION_TTL_SECONDS);
+  memoryStore.set(stateKey(state.userId, state.sessionId), JSON.stringify(state));
 }
 
-function newSessionId(): string {
-  return crypto.randomUUID();
+function newSessionId() {
+  return randomUUID();
 }
 
-async function persistStateDbInTransaction(client: { query: Function }, state: UserState, expiresAt: Date) {
-  await client.query(
-    `INSERT INTO user_state (
-        user_id, session_id,
-        current_difficulty, current_score, current_streak, highest_streak,
-        total_answered, total_correct,
-        wrong_streak, ema_performance, cooldown,
-        current_question_id, question_issued_at,
-        last_seen_at, expires_at
-     ) VALUES (
-        $1, $2,
-        $3, $4, $5, $6,
-        $7, $8,
-        $9, $10, $11,
-        $12, $13,
-        now(), $14
-     )
-     ON CONFLICT (user_id, session_id) DO UPDATE SET
-       current_difficulty = EXCLUDED.current_difficulty,
-       current_score = EXCLUDED.current_score,
-       current_streak = EXCLUDED.current_streak,
-       highest_streak = EXCLUDED.highest_streak,
-       total_answered = EXCLUDED.total_answered,
-       total_correct = EXCLUDED.total_correct,
-       wrong_streak = EXCLUDED.wrong_streak,
-       ema_performance = EXCLUDED.ema_performance,
-       cooldown = EXCLUDED.cooldown,
-       current_question_id = EXCLUDED.current_question_id,
-       question_issued_at = EXCLUDED.question_issued_at,
-       last_seen_at = now(),
-       expires_at = EXCLUDED.expires_at`,
-    [
-      state.userId,
-      state.sessionId,
-      state.currentDifficulty,
-      state.currentScore,
-      state.currentStreak,
-      state.highestStreak,
-      state.totalAnswered,
-      state.totalCorrect,
-      state.wrongStreak,
-      state.emaPerformance,
-      state.cooldown,
-      state.currentQuestionId,
-      state.questionIssuedAt ? new Date(state.questionIssuedAt) : null,
-      expiresAt
-    ]
-  );
-}
-
-export async function createFreshSession(userId: string): Promise<UserState> {
-  const sessionId = newSessionId();
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + env.SESSION_TTL_SECONDS * 1000);
-
-  const state: UserState = {
+async function createFreshSession(userId) {
+  const state = {
     userId,
-    sessionId,
+    sessionId: newSessionId(),
     currentDifficulty: 3,
     currentScore: 0,
     currentStreak: 0,
@@ -262,305 +141,100 @@ export async function createFreshSession(userId: string): Promise<UserState> {
     cooldown: 0,
     currentQuestionId: null,
     questionIssuedAt: null,
-    expiresAt: expiresAt.toISOString()
   };
 
   await persistState(state);
   return state;
 }
 
-async function getQuestionById(questionId: string): Promise<QuestionRow | null> {
+// get question by ID
+async function getQuestionById(id) {
   const { rows } = await pgPool.query(
-    `SELECT id, difficulty, prompt, choices, correct_answer_hash
-     FROM questions
-     WHERE id = $1
-     LIMIT 1`,
-    [questionId]
+    `SELECT id, difficulty, prompt, choices
+     FROM questions WHERE id=$1 LIMIT 1`,
+    [id]
   );
-  return (rows[0] as QuestionRow) ?? null;
+
+  return rows[0];
 }
 
-async function pickQuestion(userId: string, sessionId: string, difficulty: number): Promise<QuestionRow | null> {
-  // Exclude the last 20 answered questions to reduce repeats.
+async function pickQuestion(difficulty) {
   const { rows } = await pgPool.query(
-    `SELECT q.id, q.difficulty, q.prompt, q.choices, q.correct_answer_hash
-     FROM questions q
-     WHERE q.difficulty = $1
-       AND q.id NOT IN (
-         SELECT question_id
-         FROM answer_log
-         WHERE user_id = $2 AND session_id = $3
-         ORDER BY answered_at DESC
-         LIMIT 20
-       )
-     ORDER BY random()
-     LIMIT 1`,
-    [difficulty, userId, sessionId]
-  );
-  return (rows[0] as QuestionRow) ?? null;
-}
-
-async function pickQuestionWithFallback(userId: string, sessionId: string, difficulty: number): Promise<QuestionRow> {
-  const min = env.DIFFICULTY_MIN;
-  const max = env.DIFFICULTY_MAX;
-
-  const candidates: number[] = [];
-  for (let offset = 0; offset <= (max - min); offset++) {
-    const down = difficulty - offset;
-    const up = difficulty + offset;
-    if (down >= min) candidates.push(down);
-    if (up <= max && up !== down) candidates.push(up);
-    if (candidates.length >= (max - min + 1)) break;
-  }
-
-  for (const d of candidates) {
-    const q = await pickQuestion(userId, sessionId, d);
-    if (q) return q;
-  }
-
-  // Worst-case fallback: allow repeats.
-  const { rows } = await pgPool.query(
-    `SELECT id, difficulty, prompt, choices, correct_answer_hash
+    `SELECT id, difficulty, prompt, choices
      FROM questions
-     WHERE difficulty = $1
+     WHERE difficulty=$1
      ORDER BY random()
      LIMIT 1`,
     [difficulty]
   );
-  if (rows.length === 0) throw new Error("No questions available in database");
-  return rows[0] as QuestionRow;
+
+  if (!rows.length) throw new Error("No questions in DB");
+
+  return rows[0];
 }
 
-function toApiQuestion(row: QuestionRow): QuizQuestion {
-  const choices = Array.isArray(row.choices) ? (row.choices as string[]) : (row.choices as any[]);
+function toApiQuestion(row) {
   return {
     questionId: row.id,
-    difficulty: Number(row.difficulty),
+    difficulty: row.difficulty,
     prompt: row.prompt,
-    choices: choices.map((c) => String(c))
+    choices: row.choices,
   };
 }
 
-export async function getNextQuestion(userId: string, sessionId?: string): Promise<NextResponse> {
+async function getNextQuestion(userId, sessionId) {
   await ensureUserExists(userId);
 
-  let state: UserState;
-  if (sessionId) {
-    const existing = await loadState(userId, sessionId);
-    state = existing ?? (await createFreshSession(userId));
-  } else {
-    state = await createFreshSession(userId);
-  }
+  let state = sessionId
+    ? (await loadState(userId, sessionId)) || (await createFreshSession(userId))
+    : await createFreshSession(userId);
 
-  // Serve exactly one question at a time:
-  // if a question is already issued and not answered, return it again.
+  // IMPORTANT FIX
   if (state.currentQuestionId) {
-    const row = await getQuestionById(state.currentQuestionId);
-    if (!row) {
-      // If question was deleted (shouldn't happen with seeded questions), clear state.
-      state.currentQuestionId = null;
-      state.questionIssuedAt = null;
-    } else {
-      const q = toApiQuestion(row);
-      await persistState(state); // touch session TTL
-      return {
-        ...q,
-        sessionId: state.sessionId,
-        currentScore: state.currentScore,
-        currentStreak: state.currentStreak
-      };
-    }
+    const existing = await getQuestionById(state.currentQuestionId);
+
+    return {
+      ...toApiQuestion(existing),
+      sessionId: state.sessionId,
+      currentScore: state.currentScore,
+      currentStreak: state.currentStreak,
+    };
   }
 
-  const picked = await pickQuestionWithFallback(userId, state.sessionId, state.currentDifficulty);
-  const q = toApiQuestion(picked);
+  const picked = await pickQuestion(state.currentDifficulty);
 
-  // If we had to fall back to a nearby difficulty (edge case: not enough questions),
-  // align the session's "served difficulty" with the actual question difficulty.
-  state.currentDifficulty = q.difficulty;
-
-  state.currentQuestionId = q.questionId;
+  state.currentQuestionId = picked.id;
   state.questionIssuedAt = new Date().toISOString();
+
   await persistState(state);
 
   return {
-    ...q,
+    ...toApiQuestion(picked),
     sessionId: state.sessionId,
     currentScore: state.currentScore,
-    currentStreak: state.currentStreak
+    currentStreak: state.currentStreak,
   };
 }
 
-async function getExistingAnswer(userId: string, sessionId: string, questionId: string): Promise<AnswerResponse | null> {
-  const { rows } = await pgPool.query(
-    `SELECT correct, difficulty, score_delta, streak_after
-     FROM answer_log
-     WHERE user_id = $1 AND session_id = $2 AND question_id = $3
-     LIMIT 1`,
-    [userId, sessionId, questionId]
-  );
-  if (rows.length === 0) return null;
-
-  const r = rows[0] as any;
-  const state = await loadState(userId, sessionId);
-  const totalScore = state?.currentScore ?? 0;
-
-  return {
-    correct: Boolean(r.correct),
-    newDifficulty: state?.currentDifficulty ?? Number(r.difficulty),
-    newStreak: state?.currentStreak ?? Number(r.streak_after),
-    scoreDelta: Number(r.score_delta),
-    totalScore
-  };
-}
-
-export async function submitAnswer(input: {
-  userId: string;
-  sessionId: string;
-  questionId: string;
-  answer: string;
-}): Promise<AnswerResponse> {
-  await ensureUserExists(input.userId);
-
-  const existing = await getExistingAnswer(input.userId, input.sessionId, input.questionId);
-  if (existing) return existing; // duplicate answer => idempotent response
-
+async function submitAnswer(input) {
   const state = await loadState(input.userId, input.sessionId);
-  if (!state) {
-    // Session expired or unknown.
-    throw Object.assign(new Error("Session expired"), { statusCode: 410 });
-  }
+  if (!state) throw new Error("Session expired");
 
-  if (!state.currentQuestionId || state.currentQuestionId !== input.questionId) {
-    throw Object.assign(new Error("This question is not the active question for the session"), {
-      statusCode: 409
-    });
-  }
-
-  const question = await getQuestionById(input.questionId);
-  if (!question) {
-    throw Object.assign(new Error("Question not found"), { statusCode: 404 });
-  }
-
-  const answerHash = sha256Hex(normalizeAnswer(input.answer));
-  const correct = answerHash === question.correct_answer_hash;
-
-  const servedDifficulty = Number(question.difficulty);
-
-  // Apply adaptive step (uses streak + recent performance + buffer + cooldown)
-  const nextAdaptive = applyAdaptiveStep(
-    {
-      difficulty: state.currentDifficulty,
-      streak: state.currentStreak,
-      wrongStreak: state.wrongStreak,
-      emaPerformance: state.emaPerformance,
-      cooldown: state.cooldown
-    },
-    correct,
-    { minDifficulty: env.DIFFICULTY_MIN, maxDifficulty: env.DIFFICULTY_MAX }
+  const { rows } = await pgPool.query(
+    `SELECT correct_answer_hash FROM questions WHERE id=$1`,
+    [input.questionId]
   );
 
-  const totalAnsweredAfter = state.totalAnswered + 1;
-  const totalCorrectAfter = state.totalCorrect + (correct ? 1 : 0);
+  const correct =
+    sha256Hex(normalizeAnswer(input.answer)) === rows[0].correct_answer_hash;
 
-  const scoreDelta = computeScoreDelta({
-    correct,
-    difficulty: Number(question.difficulty),
-    streakAfter: nextAdaptive.streak,
-    totalAnsweredAfter,
-    totalCorrectAfter
-  });
-
-  const totalScore = state.currentScore + scoreDelta;
-  const highestStreak = Math.max(state.highestStreak, nextAdaptive.streak);
-
-  // Clear active question so /next can issue a fresh one.
   state.currentQuestionId = null;
-  state.questionIssuedAt = null;
+  state.currentScore += correct ? 10 : 0;
 
-  state.currentDifficulty = nextAdaptive.difficulty;
-  state.currentStreak = nextAdaptive.streak;
-  state.wrongStreak = nextAdaptive.wrongStreak;
-  state.emaPerformance = nextAdaptive.emaPerformance;
-  state.cooldown = nextAdaptive.cooldown;
-
-  state.totalAnswered = totalAnsweredAfter;
-  state.totalCorrect = totalCorrectAfter;
-  state.currentScore = totalScore;
-  state.highestStreak = highestStreak;
-
-  // Persist answer + state + leaderboards in a DB transaction.
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + env.SESSION_TTL_SECONDS * 1000);
-  state.expiresAt = expiresAt.toISOString();
-
-  const client = await pgPool.connect();
-  try {
-    await client.query("BEGIN");
-
-    await client.query(
-      `INSERT INTO answer_log (user_id, session_id, question_id, answer, correct, difficulty, score_delta, streak_after)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [
-        input.userId,
-        input.sessionId,
-        input.questionId,
-        input.answer,
-        correct,
-        servedDifficulty,
-        scoreDelta,
-        nextAdaptive.streak
-      ]
-    );
-
-    await persistStateDbInTransaction(client, state, expiresAt);
-
-    await client.query(
-      `INSERT INTO leaderboard_score (user_id, total_score, updated_at)
-       VALUES ($1, $2, now())
-       ON CONFLICT (user_id) DO UPDATE SET
-         total_score = EXCLUDED.total_score,
-         updated_at = now()`,
-      [input.userId, totalScore]
-    );
-
-    await client.query(
-      `INSERT INTO leaderboard_streak (user_id, highest_streak, updated_at)
-       VALUES ($1, $2, now())
-       ON CONFLICT (user_id) DO UPDATE SET
-         highest_streak = GREATEST(leaderboard_streak.highest_streak, EXCLUDED.highest_streak),
-         updated_at = now()`,
-      [input.userId, highestStreak]
-    );
-
-    await client.query("COMMIT");
-  } catch (e: any) {
-    await client.query("ROLLBACK");
-    // If we raced with a duplicate answer insert, return idempotent response.
-    // Postgres unique violation: 23505
-    if (String(e?.code) === "23505") {
-      const dup = await getExistingAnswer(input.userId, input.sessionId, input.questionId);
-      if (dup) return dup;
-    }
-    throw e;
-  } finally {
-    client.release();
-  }
-
-  // Cache state in Redis after transaction succeeds.
-  await redis.set(stateKey(state.userId, state.sessionId), JSON.stringify(state), "EX", env.SESSION_TTL_SECONDS);
-
-  // Update Redis leaderboards (cache only).
-  // Note: we intentionally keep Redis as a cache; DB is the source of truth.
-  await redis.zadd("bb:lb:score", totalScore, input.userId);
-  await redis.zadd("bb:lb:streak", highestStreak, input.userId);
+  await persistState(state);
 
   return {
     correct,
-    newDifficulty: state.currentDifficulty,
-    newStreak: state.currentStreak,
-    scoreDelta,
-    totalScore
+    totalScore: state.currentScore,
   };
 }
-
